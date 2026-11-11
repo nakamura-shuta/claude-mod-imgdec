@@ -1,4 +1,5 @@
 import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
+import { DIR_PREFIX, imageExtension, isReducedCopy, mentionsDir, mentionsOf, tokensOf, withoutMarks, withoutReplaced } from './text'
 
 // ── Settings ──
 
@@ -94,7 +95,6 @@ async function findTools($: EngineInterface): Promise<Tools> {
 // nobody can take first) in the per-user temporary folder. The files are kept
 // for a while in case the model reads them again; folders older than
 // KEEP_DAYS are removed the next time a prompt carries an image.
-const DIR_PREFIX = 'claude-imgdec.'
 const KEEP_DAYS = 1
 
 async function tmpOf($: EngineInterface): Promise<string> {
@@ -146,11 +146,6 @@ type Reduced = {
   path: string
   /** What was done, for the person: `2000×1333 → 1024×682 (resize, ~3,456 → 925 tokens)`. */
   summary: string
-}
-
-/** Claude's image cost: one token per 28×28 px patch, a partial patch counting whole. */
-function tokensOf(size: Size): number {
-  return Math.ceil(size.width / 28) * Math.ceil(size.height / 28)
 }
 
 async function sizeOf($: EngineInterface, path: string): Promise<Size | undefined> {
@@ -416,10 +411,9 @@ export const register: Register = on => {
     // The second Enter of `resend`: the engine has attached the `@` files, and
     // the originals are still on the prompt. Their blocks and `[Image #N]`
     // marks are taken out; an image added since is sent as it is.
-    if (refilled !== undefined && e.text.includes(`@${refilled.dir}/`)) {
+    if (refilled !== undefined && mentionsDir(e.text, refilled.dir)) {
       const { replaced } = refilled
-      let mark = 0
-      const text = e.text.replace(/\[Image #\d+\]/g, found => (replaced[mark++] === true ? '' : found)).trim()
+      const text = withoutMarks(e.text, replaced)
 
       refilled = undefined
       pending.push(replaced)
@@ -470,7 +464,7 @@ export const register: Register = on => {
     if (settings.mode === 'resend') {
       // The engine expands an `@` mention only in a prompt the person submits,
       // so this one is cancelled; the engine puts its draft back in the box.
-      const filled = await $.prompt.fill({ text: ` ${reduced.map(one => `@${one.path}`).join(' ')} `, mode: 'append' })
+      const filled = await $.prompt.fill({ text: mentionsOf(reduced.map(one => one.path)), mode: 'append' })
 
       if (filled.isFilled) {
         refilled = { dir, replaced }
@@ -498,10 +492,10 @@ export const register: Register = on => {
   // An image named with `@`: the engine attaches the file itself (no Read), so
   // a reduced copy is read in its place. In both modes.
   on('prompt.mention', async ($, e, next) => {
-    const extension = /\.(png|jpe?g|webp)$/i.exec(e.path)?.[1]?.toLowerCase()
+    const extension = imageExtension(e.path)
 
     // Not an image, or a reduced copy already (the second Enter of `resend`).
-    if (extension === undefined || e.path.includes(`/${DIR_PREFIX}`)) {
+    if (extension === undefined || isReducedCopy(e.path)) {
       return next(e)
     }
 
@@ -549,11 +543,6 @@ export const register: Register = on => {
 
     pending.shift()
 
-    let index = 0
-    const content = e.message.content.filter(
-      block => block.type !== 'image' || replaced[index++] !== true,
-    )
-
-    return next({ ...e, message: { ...e.message, content } })
+    return next({ ...e, message: { ...e.message, content: withoutReplaced(e.message.content, replaced) } })
   })
 }

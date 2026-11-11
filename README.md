@@ -75,6 +75,15 @@ Read は操作が今までどおりですが、往復が1回増えます。手�
 - macOS（1枚で試しただけ）: `@` で指定した画像のすり替え、再送信
 - Linux: 使うコマンド（ImageMagick 6 など）を Ubuntu 24.04 で試しただけで、Claude Code 上では未確認
 
+## 開発
+
+```bash
+claude plugin test imgdec       # テスト
+claude plugin validate imgdec   # mod として読み込めるかの検査
+```
+
+テストは、パスと本文の変換（`hooks/text.ts`）と、`@` のすり替え・`/imgdec` の各コマンド（外部コマンドを偽物に差し替えて実行）を確かめます。添付した画像を縮小する流れは、テスト環境で添付の中身を用意できないため、手で確認しています。
+
 ## ライセンス
 
 MIT
