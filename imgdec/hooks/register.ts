@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 // Longest edge, in pixels, an attached image may keep. Larger ones are
 // downscaled to this; smaller ones are left attached as they are.
 const MAX_EDGE = 1024
-const DIR = '/tmp/claude-image-shrink'
+const DIR = '/tmp/claude-imgdec'
 
 // GIF is left alone: sips would flatten an animation to one frame.
 const EXTENSION: Record<string, string> = {
@@ -115,7 +115,7 @@ export const register: Register = on => {
       `Read each file to view the image:\n${paths.join('\n')}`
 
     pending.push(replaced)
-    $.ui.toast(`image-shrink: ${paths.length} image(s) → ≤${MAX_EDGE}px`)
+    $.ui.toast(`imgdec: ${paths.length} image(s) → ≤${MAX_EDGE}px`)
 
     const entered = await next({ ...e, context: [...(e.context ?? []), note] })
 

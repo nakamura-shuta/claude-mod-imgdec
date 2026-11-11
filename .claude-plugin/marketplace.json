@@ -6,8 +6,8 @@
   },
   "plugins": [
     {
-      "name": "image-shrink",
-      "source": "./image-shrink"
+      "name": "imgdec",
+      "source": "./imgdec"
     }
   ]
 }
