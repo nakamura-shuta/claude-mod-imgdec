@@ -4,8 +4,8 @@ import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 
 /**
  * What the mod does to an attached image. Kept whole in `$.store` under
- * SETTINGS_KEY; only `isOn` has a command today (`/imgdec on|off`), the rest
- * are here so a later command can set them.
+ * SETTINGS_KEY and set by `/imgdec on|off` and `/imgdec max <px>`; `isTrimOn`
+ * has no command yet.
  */
 type Settings = {
   isOn: boolean
@@ -17,7 +17,10 @@ type Settings = {
 
 const DEFAULTS: Settings = { isOn: true, maxEdge: 1024, isTrimOn: true }
 const SETTINGS_KEY = 'settings'
-const USAGE = 'Usage: /imgdec [on|off]'
+const USAGE = 'Usage: /imgdec [on|off|max <px>]'
+// What `/imgdec max` takes: under it text is lost, over it the engine has resized already.
+const MIN_MAX_EDGE = 256
+const MAX_MAX_EDGE = 2000
 
 /** The stored settings, each field falling back to its default when absent or of the wrong kind. */
 async function readSettings($: EngineInterface): Promise<Settings> {
@@ -26,7 +29,10 @@ async function readSettings($: EngineInterface): Promise<Settings> {
 
   return {
     isOn: typeof held.isOn === 'boolean' ? held.isOn : DEFAULTS.isOn,
-    maxEdge: typeof held.maxEdge === 'number' && held.maxEdge >= 64 ? held.maxEdge : DEFAULTS.maxEdge,
+    maxEdge:
+      typeof held.maxEdge === 'number' && held.maxEdge >= MIN_MAX_EDGE && held.maxEdge <= MAX_MAX_EDGE
+        ? held.maxEdge
+        : DEFAULTS.maxEdge,
     isTrimOn: typeof held.isTrimOn === 'boolean' ? held.isTrimOn : DEFAULTS.isTrimOn,
   }
 }
@@ -286,6 +292,20 @@ async function runImgdec($: EngineInterface, args: string): Promise<CommandRunRe
     }
   }
 
+  const max = /^max\s+(\d+)(?:px)?$/.exec(arg)
+
+  if (max !== null) {
+    const maxEdge = Number(max[1])
+
+    if (maxEdge < MIN_MAX_EDGE || maxEdge > MAX_MAX_EDGE) {
+      return { text: `Max edge must be ${MIN_MAX_EDGE}-${MAX_MAX_EDGE}px. Now: ${settings.maxEdge}px.` }
+    }
+
+    await $.store.set(SETTINGS_KEY, { ...settings, maxEdge })
+
+    return { text: `Max edge: ${maxEdge}px. Larger images are downscaled to it.` }
+  }
+
   if (arg !== '') {
     return { text: USAGE }
   }
@@ -326,8 +346,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'imgdec',
-      description: 'Reduce attached images before Claude reads them (on|off; no argument shows the status)',
-      argumentHint: 'on|off',
+      description: 'Reduce attached images before Claude reads them (on|off, max <px>; no argument shows the status)',
+      argumentHint: 'on|off|max <px>',
       immediate: true,
     })
 
