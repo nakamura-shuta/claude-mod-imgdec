@@ -103,15 +103,20 @@ async function tmpOf($: EngineInterface): Promise<string> {
   return tmp === '' ? '/tmp' : tmp
 }
 
-/** Removes the old folders, then makes this prompt's own and returns its path. */
-async function makeDir($: EngineInterface): Promise<string> {
+/**
+ * Makes this prompt's own folder and returns its path, the old folders
+ * removed first unless `isQuick` (an `@` mention keeps the prompt waiting).
+ */
+async function makeDir($: EngineInterface, isQuick = false): Promise<string> {
   const tmp = await tmpOf($)
 
-  // Before the new one is made, so it cannot be among them.
-  await $.process.run([
-    'find', tmp, '-maxdepth', '1', '-type', 'd', '-name', `${DIR_PREFIX}*`,
-    '-mtime', `+${KEEP_DAYS}`, '-exec', 'rm', '-rf', '{}', '+',
-  ])
+  if (!isQuick) {
+    // Before the new one is made, so it cannot be among them.
+    await $.process.run([
+      'find', tmp, '-maxdepth', '1', '-type', 'd', '-name', `${DIR_PREFIX}*`,
+      '-mtime', `+${KEEP_DAYS}`, '-exec', 'rm', '-rf', '{}', '+',
+    ])
+  }
 
   const made = await $.process.run(['mktemp', '-d', `${tmp}/${DIR_PREFIX}XXXXXX`])
   const dir = made.stdout.trim()
@@ -148,96 +153,136 @@ type Reduced = {
   summary: string
 }
 
+/** The size of the image at `path`, by macOS's `sips`. */
 async function sizeOf($: EngineInterface, path: string): Promise<Size | undefined> {
-  const { magick } = await findTools($)
-  const read = magick
-    ? await $.process.run([...magick.identify, '-format', '%w %h', path])
-    : await $.process.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', path])
-  const found = magick
-    ? /^(\d+) (\d+)/.exec(read.stdout)
-    : /pixelWidth: (\d+)[\s\S]*pixelHeight: (\d+)/.exec(read.stdout)
+  const read = await $.process.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', path])
+
+  return sizeIn(read.stdout, /pixelWidth: (\d+)[\s\S]*pixelHeight: (\d+)/)
+}
+
+/** Downscales the image at `path`, in place, by `sips`; false when it fails. */
+async function resize($: EngineInterface, path: string, maxEdge: number): Promise<boolean> {
+  return (await $.process.run(['sips', '-Z', String(maxEdge), path])).exitCode === 0
+}
+
+// With ImageMagick an image is read twice and written once, whatever is done
+// to it. PNG is written with light compression: the token cost is the
+// pixels', not the file's, and the prompt waits on this.
+const FAST_PNG = ['-define', 'png:compression-level=1', '-define', 'png:compression-filter=0']
+
+// A copy the engine attaches for an `@` mention has to be a small file: it
+// attaches nothing for a large one (seen: 243 KB attached, 517 KB not). Such a
+// copy is written as JPEG, and again at a lower quality when still over the cap.
+const MENTION_MAX_BYTES = 200_000
+const JPEG = ['-background', 'white', '-flatten', '-quality', '85']
+const JPEG_SMALLER = ['-quality', '60']
+
+/** The size of the file at `path` in bytes; undefined when it cannot be read. */
+async function bytesOf($: EngineInterface, path: string): Promise<number | undefined> {
+  const counted = await $.process.run(['wc', '-c', path])
+  const bytes = Number(/^\s*(\d+)/.exec(counted.stdout)?.[1])
+
+  return counted.exitCode === 0 && bytes > 0 ? bytes : undefined
+}
+
+/** `text` as a size, read from where two numbers stand `<width><between><height>`. */
+function sizeIn(text: string, pattern: RegExp): Size | undefined {
+  const found = pattern.exec(text)
   const width = Number(found?.[1])
   const height = Number(found?.[2])
 
   return width > 0 && height > 0 ? { width, height } : undefined
 }
 
-/** Downscales the image at `path`, in place, so its longest edge is `maxEdge`; false when it fails. */
-async function resize($: EngineInterface, path: string, maxEdge: number): Promise<boolean> {
-  const { magick } = await findTools($)
-  const ran = magick
-    ? await $.process.run([...magick.convert, path, '-resize', `${maxEdge}x${maxEdge}>`, path])
-    : await $.process.run(['sips', '-Z', String(maxEdge), path])
-
-  return ran.exitCode === 0
-}
-
 /**
- * Trims the plain margin around the image at `path`, in place, and returns
- * the new size; undefined when there is no ImageMagick, the trim fails, or it
- * is not worth keeping (the file is then as it was).
+ * Reduces the image file at `path` (margin trimmed, then downscaled if still
+ * large). Undefined, and the file removed, when there is nothing to gain or a
+ * step fails.
+ *
+ * `isMentioned`: the copy is for the engine to attach as an `@` mention, so it
+ * is written beside `path` as a small JPEG (ImageMagick only), and `path` is
+ * removed; else it is reduced in place, in its own format.
  */
-async function trim($: EngineInterface, path: string, before: Size): Promise<Size | undefined> {
+async function shrink(
+  $: EngineInterface,
+  settings: Settings,
+  path: string,
+  isMentioned = false,
+): Promise<Reduced | undefined> {
   const { magick } = await findTools($)
-
-  if (magick === undefined) {
-    return undefined
-  }
-
-  const trimmedPath = path.replace(/(\.\w+)$/, '-trim$1')
-  const ran = await $.process.run([...magick.convert, path, '-fuzz', TRIM_FUZZ, '-trim', '+repage', trimmedPath])
-  const after = ran.exitCode === 0 ? await sizeOf($, trimmedPath) : undefined
-  const isWorthIt =
-    after !== undefined &&
-    Math.min(after.width, after.height) >= MIN_EDGE &&
-    after.width * after.height <= before.width * before.height * TRIM_WORTH
-
-  if (!isWorthIt) {
-    await $.process.run(['rm', '-f', trimmedPath])
-
-    return undefined
-  }
-
-  await $.process.run(['mv', '-f', trimmedPath, path])
-
-  return after
-}
-
-/**
- * Reduces the image file at `path` in place (margin trimmed, then downscaled
- * if still large). Undefined, and the file removed, when there is nothing to
- * gain or a step fails.
- */
-async function shrink($: EngineInterface, settings: Settings, path: string): Promise<Reduced | undefined> {
-  const before = await sizeOf($, path)
   const steps: string[] = []
-  let after = before
+  const out = isMentioned ? path.replace(/\.\w+$/, '-s.jpg') : path
+  let before: Size | undefined
+  let after: Size | undefined
 
-  if (after !== undefined && before !== undefined && settings.isTrimOn) {
-    const trimmed = await trim($, path, before)
+  if (magick !== undefined) {
+    // The size, and the box a trim would leave (`%@`: 1546x737+63+102), without writing anything.
+    const probed = await $.process.run([...magick.convert, path, '-fuzz', TRIM_FUZZ, '-format', '%w %h %@', 'info:'])
+    const box = /(\d+x\d+[+-]\d+[+-]\d+)\s*$/.exec(probed.stdout)?.[1]
+    const trimmed = box === undefined ? undefined : sizeIn(box, /^(\d+)x(\d+)/)
 
-    if (trimmed !== undefined) {
-      after = trimmed
+    before = probed.exitCode === 0 ? sizeIn(probed.stdout, /^(\d+) (\d+)/) : undefined
+
+    const isTrimWorthIt =
+      settings.isTrimOn &&
+      before !== undefined &&
+      trimmed !== undefined &&
+      Math.min(trimmed.width, trimmed.height) >= MIN_EDGE &&
+      trimmed.width * trimmed.height <= before.width * before.height * TRIM_WORTH
+    const kept = isTrimWorthIt ? trimmed : before
+    const change: string[] = []
+
+    if (isTrimWorthIt && box !== undefined) {
+      change.push('-crop', box, '+repage')
       steps.push('trim')
     }
-  }
 
-  if (after !== undefined && Math.max(after.width, after.height) > settings.maxEdge) {
-    after = (await resize($, path, settings.maxEdge)) ? await sizeOf($, path) : undefined
-    steps.push('resize')
+    if (kept !== undefined && Math.max(kept.width, kept.height) > settings.maxEdge) {
+      change.push('-resize', `${settings.maxEdge}x${settings.maxEdge}>`)
+      steps.push('resize')
+    }
+
+    if (before !== undefined && steps.length > 0) {
+      const written = await $.process.run([
+        ...magick.convert, path, ...change, ...(isMentioned ? JPEG : FAST_PNG),
+        '-format', '%w %h', '-write', 'info:', out,
+      ])
+
+      after = written.exitCode === 0 ? sizeIn(written.stdout, /^(\d+) (\d+)/) : undefined
+
+      if (after !== undefined && isMentioned && ((await bytesOf($, out)) ?? Infinity) > MENTION_MAX_BYTES) {
+        await $.process.run([...magick.convert, out, ...JPEG_SMALLER, out])
+
+        if (((await bytesOf($, out)) ?? Infinity) > MENTION_MAX_BYTES) {
+          after = undefined
+        }
+      }
+    }
+  } else if (!isMentioned) {
+    // macOS without ImageMagick: `sips` resizes, and there is no trim.
+    before = await sizeOf($, path)
+
+    if (before !== undefined && Math.max(before.width, before.height) > settings.maxEdge) {
+      after = (await resize($, path, settings.maxEdge)) ? await sizeOf($, path) : undefined
+      steps.push('resize')
+    }
   }
 
   // Nothing gained (small already, no margin), or a step failed.
   if (before === undefined || after === undefined || steps.length === 0) {
-    await $.process.run(['rm', '-f', path])
+    await $.process.run(['rm', '-f', path, out])
 
     return undefined
+  }
+
+  if (out !== path) {
+    await $.process.run(['rm', '-f', path])
   }
 
   const tokens = `~${tokensOf(before).toLocaleString('en-US')} → ${tokensOf(after).toLocaleString('en-US')} tokens`
 
   return {
-    path,
+    path: out,
     summary: `${before.width}×${before.height} → ${after.width}×${after.height} (${steps.join(' + ')}, ${tokens})`,
   }
 }
@@ -253,6 +298,7 @@ async function reduce(
   dir: string,
   id: string,
   index: number,
+  isMentioned: boolean,
 ): Promise<Reduced | undefined> {
   try {
     let base64 = ''
@@ -281,7 +327,7 @@ async function reduce(
     // Through sh for the redirect: `--decode` is the one spelling macOS and GNU share.
     const decoded = await $.process.run(['sh', '-c', 'base64 --decode > "$1"', 'sh', path], { stdin: base64 })
 
-    return decoded.exitCode === 0 ? await shrink($, settings, path) : undefined
+    return decoded.exitCode === 0 ? await shrink($, settings, path, isMentioned) : undefined
   } catch {
     return undefined
   }
@@ -439,12 +485,14 @@ export const register: Register = on => {
       return next(e)
     }
 
+    // A copy for `resend` is one the engine attaches as an `@` mention; that needs ImageMagick.
+    const isResend = settings.mode === 'resend' && found.magick !== undefined
     const dir = await makeDir($)
     const replaced: boolean[] = []
     const reduced: Reduced[] = []
 
     for (const [index, image] of images.entries()) {
-      const one = image.id === undefined ? undefined : await reduce($, settings, dir, image.id, index)
+      const one = image.id === undefined ? undefined : await reduce($, settings, dir, image.id, index, isResend)
 
       replaced.push(one !== undefined)
 
@@ -461,7 +509,7 @@ export const register: Register = on => {
     // A line in the transcript (not sent to the model): it stays, where a toast is easy to miss.
     $.ui.log(reduced.map(one => one.summary).join(' / '))
 
-    if (settings.mode === 'resend') {
+    if (isResend) {
       // The engine expands an `@` mention only in a prompt the person submits,
       // so this one is cancelled; the engine puts its draft back in the box.
       const filled = await $.prompt.fill({ text: mentionsOf(reduced.map(one => one.path)), mode: 'append' })
@@ -503,13 +551,12 @@ export const register: Register = on => {
 
     try {
       const settings = await readSettings($)
-      const found = await findTools($)
 
-      if (settings.isOn && (found.magick !== undefined || found.hasSips)) {
-        const path = `${await makeDir($)}/0.${extension}`
+      if (settings.isOn && (await findTools($)).magick !== undefined) {
+        const path = `${await makeDir($, true)}/0.${extension}`
         const copied = await $.process.run(['cp', e.path, path])
 
-        one = copied.exitCode === 0 ? await shrink($, settings, path) : undefined
+        one = copied.exitCode === 0 ? await shrink($, settings, path, true) : undefined
       }
     } catch {
       one = undefined

@@ -33,6 +33,8 @@ type Setup = {
   attached?: Size
   /** What the engine answers an `@` mention with. */
   mention?: unknown
+  /** The bytes `wc -c` counts for a written copy, call after call; absent, 90 KB. */
+  bytes?: number[]
   isFilled?: boolean
 }
 
@@ -53,6 +55,7 @@ function machine(on: unknown, setup: Setup = {}): Machine {
   }
   const hasMagick = setup.hasMagick ?? true
   let made = 0
+  const bytes = [...(setup.bytes ?? [])]
 
   hook('process.run', ((_: unknown, e: { argv: string[] }) => {
     const argv = e.argv
@@ -73,9 +76,14 @@ function machine(on: unknown, setup: Setup = {}): Machine {
     }
 
     if (a === 'rm') {
-      m.files.delete(argv[2]!)
+      for (const path of argv.slice(2)) m.files.delete(path)
       return ok()
     }
+
+    if (a === 'wc') return ok(`  ${bytes.shift() ?? 90_000} ${argv[2]}\n`)
+
+    // A second write of a copy, at a lower quality.
+    if (a === 'magick' && argv[2] === '-quality') return ok()
 
     if (a === 'mv') {
       m.files.set(argv[3]!, m.files.get(argv[2]!)!)
@@ -89,22 +97,34 @@ function machine(on: unknown, setup: Setup = {}): Machine {
       return ok()
     }
 
-    if (a === 'magick' && b === 'identify') {
-      const size = m.files.get(argv[4]!)
-      return size === undefined ? failed : ok(`${size.width} ${size.height}`)
+    // The probe: size and the box a trim would leave.
+    if (a === 'magick' && argv.includes('%w %h %@')) {
+      const size = m.files.get(b!)
+      if (size === undefined) return failed
+      const box = setup.trimTo ?? size
+      return ok(`${size.width} ${size.height} ${box.width}x${box.height}+10+20`)
     }
 
-    if (a === 'magick' && argv.includes('-trim')) {
-      m.files.set(argv[argv.length - 1]!, setup.trimTo ?? m.files.get(b!)!)
-      return ok()
-    }
+    // The one write: crop and resize as asked, the new size printed.
+    if (a === 'magick' && argv.includes('-write')) {
+      let size = m.files.get(b!)
+      if (size === undefined) return failed
+      const crop = argv.indexOf('-crop')
+      const resize = argv.indexOf('-resize')
 
-    if (a === 'magick' && argv[2] === '-resize') {
-      const size = m.files.get(b!)!
-      const max = Number(/^(\d+)x/.exec(argv[3]!)![1])
-      const scale = Math.min(1, max / Math.max(size.width, size.height))
-      m.files.set(argv[4]!, { width: Math.round(size.width * scale), height: Math.round(size.height * scale) })
-      return ok()
+      if (crop !== -1) {
+        const found = /^(\d+)x(\d+)/.exec(argv[crop + 1]!)!
+        size = { width: Number(found[1]), height: Number(found[2]) }
+      }
+
+      if (resize !== -1) {
+        const max = Number(/^(\d+)x/.exec(argv[resize + 1]!)![1])
+        const scale = Math.min(1, max / Math.max(size.width, size.height))
+        size = { width: Math.round(size.width * scale), height: Math.round(size.height * scale) }
+      }
+
+      m.files.set(argv[argv.length - 1]!, size)
+      return ok(`${size.width} ${size.height}`)
     }
 
     return failed
@@ -139,7 +159,8 @@ function machine(on: unknown, setup: Setup = {}): Machine {
 
 const LARGE = { width: 2400, height: 1500 }
 const SMALL = { width: 800, height: 600 }
-const COPY = `${TMP}/claude-imgdec.TEST01/0.png`
+const COPY = `${TMP}/claude-imgdec.TEST01/0-s.jpg`
+const WORK = `${TMP}/claude-imgdec.TEST01/0.png`
 
 // ── `@` mentions ──
 
@@ -164,9 +185,8 @@ test('a path with spaces and Japanese reaches cp as one argument, and keeps its 
 
   await $.prompt.mention({ mention: path, path })
 
-  const copy = `${TMP}/claude-imgdec.TEST01/0.jpeg`
-  expect(m.ran.find(argv => argv[0] === 'cp')).toEqual(['cp', path, copy])
-  expect(m.mentioned).toEqual([copy])
+  expect(m.ran.find(argv => argv[0] === 'cp')).toEqual(['cp', path, `${TMP}/claude-imgdec.TEST01/0.jpeg`])
+  expect(m.mentioned).toEqual([COPY])
 })
 
 test('the max edge the person set is the one used', async ($, on) => {
@@ -184,7 +204,78 @@ test('a margin worth trimming is trimmed, and no resize follows when it then fit
 
   expect(m.files.get(COPY)).toEqual({ width: 801, height: 421 })
   expect(m.ran.some(argv => argv.includes('-resize'))).toBe(false)
+  expect(m.ran.some(argv => argv.includes('-crop'))).toBe(true)
   expect(m.logs.join()).toContain('(trim, ')
+})
+
+test('trim and resize are done in one write, after one probe', async ($, on) => {
+  const m = machine(on, { files: { '/pics/shot.png': LARGE }, trimTo: { width: 2000, height: 1000 } })
+
+  await $.prompt.mention({ mention: '/pics/shot.png', path: '/pics/shot.png' })
+
+  const magick = m.ran.filter(argv => argv[0] === 'magick' && argv[1] !== '-version')
+  expect(magick.length).toBe(2)
+  expect(magick[1]).toContain('-crop')
+  expect(magick[1]).toContain('2000x1000+10+20')
+  expect(magick[1]).toContain('1024x1024>')
+  expect(m.files.get(COPY)).toEqual({ width: 1024, height: 512 })
+  expect(m.logs.join()).toContain('2400×1500 → 1024×512 (trim + resize, ')
+})
+
+test('a trim that gains too little is not made', async ($, on) => {
+  const m = machine(on, { files: { '/pics/shot.png': LARGE }, trimTo: { width: 2400, height: 1360 } })
+
+  await $.prompt.mention({ mention: '/pics/shot.png', path: '/pics/shot.png' })
+
+  expect(m.ran.some(argv => argv.includes('-crop'))).toBe(false)
+  expect(m.files.get(COPY)).toEqual({ width: 1024, height: 640 })
+})
+
+test('no old folder is swept for an @ mention (no time for it)', async ($, on) => {
+  const m = machine(on, { files: { '/pics/shot.png': LARGE } })
+
+  await $.prompt.mention({ mention: '/pics/shot.png', path: '/pics/shot.png' })
+
+  expect(m.ran.some(argv => argv[0] === 'find')).toBe(false)
+})
+
+test('the copy is a JPEG beside the working file, which is removed', async ($, on) => {
+  const m = machine(on, { files: { '/pics/shot.png': LARGE } })
+
+  await $.prompt.mention({ mention: '/pics/shot.png', path: '/pics/shot.png' })
+
+  const written = m.ran.find(argv => argv.includes('-write'))!
+  expect(written).toContain('-flatten')
+  expect(written[written.length - 1]).toBe(COPY)
+  expect(m.files.has(WORK)).toBe(false)
+})
+
+test('a copy over the size the engine attaches is written again at a lower quality', async ($, on) => {
+  const m = machine(on, { files: { '/pics/shot.png': LARGE }, bytes: [450_000, 150_000] })
+
+  await $.prompt.mention({ mention: '/pics/shot.png', path: '/pics/shot.png' })
+
+  expect(m.ran.filter(argv => argv[2] === '-quality').length).toBe(1)
+  expect(m.mentioned).toEqual([COPY])
+})
+
+test('a copy still too large is given up: the file is read as it is, with no note', async ($, on) => {
+  const m = machine(on, { files: { '/pics/shot.png': LARGE }, bytes: [450_000, 300_000] })
+
+  const result = await $.prompt.mention({ mention: '/pics/shot.png', path: '/pics/shot.png' })
+
+  expect(m.mentioned).toEqual(['/pics/shot.png'])
+  expect(m.files.has(COPY)).toBe(false)
+  expect(result.context).toBeUndefined()
+  expect(m.logs).toEqual([])
+})
+
+test('without ImageMagick an image named with @ is read as it is', async ($, on) => {
+  const m = machine(on, { files: { '/pics/shot.png': LARGE }, hasMagick: false, hasSips: true })
+
+  await $.prompt.mention({ mention: '/pics/shot.png', path: '/pics/shot.png' })
+
+  expect(m.mentioned).toEqual(['/pics/shot.png'])
 })
 
 test('a small image with no margin is read as it is, and its copy removed', async ($, on) => {
@@ -194,6 +285,7 @@ test('a small image with no margin is read as it is, and its copy removed', asyn
 
   expect(m.mentioned).toEqual(['/pics/small.png'])
   expect(m.files.has(COPY)).toBe(false)
+  expect(m.files.has(WORK)).toBe(false)
   expect(result.context).toBeUndefined()
   expect(m.logs).toEqual([])
 })
