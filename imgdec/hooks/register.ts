@@ -31,40 +31,93 @@ async function readSettings($: EngineInterface): Promise<Settings> {
   }
 }
 
-// ── Reducing one image ──
+// ── Tools (macOS and Linux) ──
 
-// Reduced images are throwaway: the per-user temporary folder (macOS: under
-// /var/folders, readable by this user alone), in a folder of our own kept at
-// 700 with files at 600, and emptied of anything older than a day.
-const DIR_NAME = 'claude-imgdec'
-const KEEP_DAYS = 1
-
-async function dirOf($: EngineInterface): Promise<string> {
-  const tmp = ((await $.env.get('TMPDIR')) ?? '').replace(/\/+$/, '')
-
-  return `${tmp === '' ? '/tmp' : tmp}/${DIR_NAME}`
+/**
+ * The commands this machine has for images, found once per load of the module.
+ * ImageMagick does everything (size, resize, trim) on macOS and Linux alike;
+ * without it, macOS's own `sips` still reads a size and resizes (no trim).
+ */
+type Tools = {
+  /** ImageMagick's argv prefixes: `magick` / `magick identify` (7), or `convert` / `identify` (6). */
+  magick?: { convert: readonly string[]; identify: readonly string[] }
+  hasSips: boolean
 }
 
-/** Makes the folder (700) and removes what earlier prompts left more than KEEP_DAYS ago. */
-async function prepareDir($: EngineInterface): Promise<string> {
-  const dir = await dirOf($)
+let tools: Tools | undefined
 
-  await $.process.run(['mkdir', '-p', dir])
-  await $.process.run(['chmod', '700', dir])
-  await $.process.run(['find', dir, '-type', 'f', '-mtime', `+${KEEP_DAYS}`, '-delete'])
+/** Whether `argv` runs here and exits 0; with `mark`, only when its output holds it. */
+async function runs($: EngineInterface, argv: readonly string[], mark?: string): Promise<boolean> {
+  try {
+    const ran = await $.process.run(argv)
+
+    return ran.exitCode === 0 && (mark === undefined || ran.stdout.includes(mark))
+  } catch {
+    return false
+  }
+}
+
+async function findTools($: EngineInterface): Promise<Tools> {
+  if (tools === undefined) {
+    const magick = (await runs($, ['magick', '-version']))
+      ? { convert: ['magick'], identify: ['magick', 'identify'] }
+      : // ImageMagick 6 (many Linux distributions). The mark keeps out another `convert`.
+        (await runs($, ['convert', '-version'], 'ImageMagick'))
+        ? { convert: ['convert'], identify: ['identify'] }
+        : undefined
+
+    tools = { magick, hasSips: await runs($, ['sips', '--version']) }
+  }
+
+  return tools
+}
+
+// ── Where reduced images go ──
+
+// A folder of its own per prompt, made by `mktemp -d` (mode 700, a name
+// nobody can take first) in the per-user temporary folder. The files are kept
+// for a while in case the model reads them again; folders older than
+// KEEP_DAYS are removed the next time a prompt carries an image.
+const DIR_PREFIX = 'claude-imgdec.'
+const KEEP_DAYS = 1
+
+async function tmpOf($: EngineInterface): Promise<string> {
+  const tmp = ((await $.env.get('TMPDIR')) ?? '').replace(/\/+$/, '')
+
+  return tmp === '' ? '/tmp' : tmp
+}
+
+/** Removes the old folders, then makes this prompt's own and returns its path. */
+async function makeDir($: EngineInterface): Promise<string> {
+  const tmp = await tmpOf($)
+
+  // Before the new one is made, so it cannot be among them.
+  await $.process.run([
+    'find', tmp, '-maxdepth', '1', '-type', 'd', '-name', `${DIR_PREFIX}*`,
+    '-mtime', `+${KEEP_DAYS}`, '-exec', 'rm', '-rf', '{}', '+',
+  ])
+
+  const made = await $.process.run(['mktemp', '-d', `${tmp}/${DIR_PREFIX}XXXXXX`])
+  const dir = made.stdout.trim()
+
+  if (made.exitCode !== 0 || dir === '') {
+    throw new Error('mktemp failed')
+  }
 
   return dir
 }
 
-// Trimming the plain margin (ImageMagick, when installed) keeps the text at
-// its size, so it runs before any downscale. A trim is kept only when it is
-// worth it (the area falls to this share or less) and leaves a real picture
-// (no edge under MIN_EDGE: a blank image trims to almost nothing).
+// ── Reducing one image ──
+
+// Trimming the plain margin (ImageMagick only) keeps the text at its size, so
+// it runs before any downscale. A trim is kept only when it is worth it (the
+// area falls to this share or less) and leaves a real picture (no edge under
+// MIN_EDGE: a blank image trims to almost nothing).
 const TRIM_FUZZ = '2%'
 const TRIM_WORTH = 0.85
 const MIN_EDGE = 32
 
-// GIF is left alone: sips would flatten an animation to one frame.
+// GIF is left alone: a resize would flatten an animation.
 const EXTENSION: Record<string, string> = {
   'image/png': 'png',
   'image/jpeg': 'jpg',
@@ -84,27 +137,28 @@ function tokensOf(size: Size): number {
   return Math.ceil(size.width / 28) * Math.ceil(size.height / 28)
 }
 
-// Whether `magick` runs here; asked once per load of the module.
-let hasMagick: boolean | undefined
-
-async function canTrim($: EngineInterface): Promise<boolean> {
-  if (hasMagick === undefined) {
-    try {
-      hasMagick = (await $.process.run(['magick', '-version'])).exitCode === 0
-    } catch {
-      hasMagick = false
-    }
-  }
-
-  return hasMagick
-}
-
 async function sizeOf($: EngineInterface, path: string): Promise<Size | undefined> {
-  const read = await $.process.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', path])
-  const width = Number(/pixelWidth: (\d+)/.exec(read.stdout)?.[1])
-  const height = Number(/pixelHeight: (\d+)/.exec(read.stdout)?.[1])
+  const { magick } = await findTools($)
+  const read = magick
+    ? await $.process.run([...magick.identify, '-format', '%w %h', path])
+    : await $.process.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', path])
+  const found = magick
+    ? /^(\d+) (\d+)/.exec(read.stdout)
+    : /pixelWidth: (\d+)[\s\S]*pixelHeight: (\d+)/.exec(read.stdout)
+  const width = Number(found?.[1])
+  const height = Number(found?.[2])
 
   return width > 0 && height > 0 ? { width, height } : undefined
+}
+
+/** Downscales the image at `path`, in place, so its longest edge is `maxEdge`; false when it fails. */
+async function resize($: EngineInterface, path: string, maxEdge: number): Promise<boolean> {
+  const { magick } = await findTools($)
+  const ran = magick
+    ? await $.process.run([...magick.convert, path, '-resize', `${maxEdge}x${maxEdge}>`, path])
+    : await $.process.run(['sips', '-Z', String(maxEdge), path])
+
+  return ran.exitCode === 0
 }
 
 /**
@@ -113,12 +167,14 @@ async function sizeOf($: EngineInterface, path: string): Promise<Size | undefine
  * is not worth keeping (the file is then as it was).
  */
 async function trim($: EngineInterface, path: string, before: Size): Promise<Size | undefined> {
-  if (!(await canTrim($))) {
+  const { magick } = await findTools($)
+
+  if (magick === undefined) {
     return undefined
   }
 
   const trimmedPath = path.replace(/(\.\w+)$/, '-trim$1')
-  const ran = await $.process.run(['magick', path, '-fuzz', TRIM_FUZZ, '-trim', '+repage', trimmedPath])
+  const ran = await $.process.run([...magick.convert, path, '-fuzz', TRIM_FUZZ, '-trim', '+repage', trimmedPath])
   const after = ran.exitCode === 0 ? await sizeOf($, trimmedPath) : undefined
   const isWorthIt =
     after !== undefined &&
@@ -171,8 +227,9 @@ async function reduce(
       return undefined
     }
 
-    const path = `${dir}/${await $.clock.now()}-${index}.${extension}`
-    const decoded = await $.process.run(['base64', '-D', '-o', path], { stdin: base64 })
+    const path = `${dir}/${index}.${extension}`
+    // Through sh for the redirect: `--decode` is the one spelling macOS and GNU share.
+    const decoded = await $.process.run(['sh', '-c', 'base64 --decode > "$1"', 'sh', path], { stdin: base64 })
     const before = decoded.exitCode === 0 ? await sizeOf($, path) : undefined
     const steps: string[] = []
     let after = before
@@ -187,9 +244,7 @@ async function reduce(
     }
 
     if (after !== undefined && Math.max(after.width, after.height) > settings.maxEdge) {
-      const resized = await $.process.run(['sips', '-Z', String(settings.maxEdge), path])
-
-      after = resized.exitCode === 0 ? await sizeOf($, path) : undefined
+      after = (await resize($, path, settings.maxEdge)) ? await sizeOf($, path) : undefined
       steps.push('resize')
     }
 
@@ -199,8 +254,6 @@ async function reduce(
 
       return undefined
     }
-
-    await $.process.run(['chmod', '600', path])
 
     const tokens = `~${tokensOf(before).toLocaleString('en-US')} → ${tokensOf(after).toLocaleString('en-US')} tokens`
 
@@ -237,16 +290,15 @@ async function runImgdec($: EngineInterface, args: string): Promise<CommandRunRe
     return { text: USAGE }
   }
 
-  const trimNote = !settings.isTrimOn
-    ? 'off'
-    : (await canTrim($))
-      ? 'on'
-      : 'unavailable (ImageMagick not found: brew install imagemagick)'
+  const found = await findTools($)
+  const toolNote = found.magick ? 'ImageMagick' : found.hasSips ? 'sips' : 'none (install ImageMagick)'
+  const trimNote = !settings.isTrimOn ? 'off' : found.magick ? 'on' : 'unavailable (needs ImageMagick)'
   const lines = [
     settings.isOn ? 'ON' : 'OFF',
     `- Max edge: ${settings.maxEdge}px`,
     `- Trim margins: ${trimNote}`,
-    `- Saved to: ${await dirOf($)}/`,
+    `- Image tool: ${toolNote}`,
+    `- Saved to: ${await tmpOf($)}/${DIR_PREFIX}*/`,
   ]
 
   if (last === undefined) {
@@ -297,7 +349,13 @@ export const register: Register = on => {
       return next(e)
     }
 
-    const dir = await prepareDir($)
+    const found = await findTools($)
+
+    if (found.magick === undefined && !found.hasSips) {
+      return next(e)
+    }
+
+    const dir = await makeDir($)
     const replaced: boolean[] = []
     const reduced: Reduced[] = []
 

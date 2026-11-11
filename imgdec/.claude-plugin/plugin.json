@@ -1,5 +1,5 @@
 {
   "name": "imgdec",
-  "version": "0.3.2",
-  "description": "Downscales images attached to a prompt (drag-and-drop or paste) before the model reads them."
+  "version": "0.4.0",
+  "description": "Reduces images attached to a prompt (trim margins, downscale) before the model reads them. macOS and Linux."
 }
