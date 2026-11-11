@@ -174,8 +174,9 @@ test('a large image named with @ is read as a reduced copy', async ($, on) => {
   expect(m.files.get('/pics/shot.png')).toEqual(LARGE)
   expect(result.type).toBe('file')
   expect(result.context?.length).toBe(1)
-  expect(result.context?.[0]).toContain('/pics/shot.png')
-  expect(result.context?.[0]).toContain(COPY)
+  // The note names no path: both are in the prompt already.
+  expect(result.context?.[0]).toContain('do not read the original file')
+  expect(result.context?.[0]).not.toContain('/pics/shot.png')
   expect(m.logs.join()).toContain('2400×1500 → 1024×640 (resize, ~4,644 → 851 tokens)')
 })
 

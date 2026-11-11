@@ -171,7 +171,7 @@ async function resize($: EngineInterface, path: string, maxEdge: number): Promis
 const FAST_PNG = ['-define', 'png:compression-level=1', '-define', 'png:compression-filter=0']
 
 // A copy the engine attaches for an `@` mention has to be a small file: it
-// attaches nothing for a large one (seen: 243 KB attached, 517 KB not). Such a
+// attaches nothing for one over 262,144 bytes (seen on Claude Code 2.1.322). Such a
 // copy is written as JPEG, and again at a lower quality when still over the cap.
 const MENTION_MAX_BYTES = 200_000
 const JPEG = ['-background', 'white', '-flatten', '-quality', '85']
@@ -413,6 +413,9 @@ async function runImgdec($: EngineInterface, args: string): Promise<CommandRunRe
 
 // ── Hooks ──
 
+const MENTIONED_NOTE =
+  'The image named with @ in this prompt is attached in reduced form: the attached file is a reduced copy of it. Use the attached copy; do not read the original file.'
+
 const RESENT_NOTE =
   'The image(s) the user attached were reduced; the @ file(s) of this prompt are the reduced copies. Use them; do not read the original files.'
 
@@ -524,7 +527,7 @@ export const register: Register = on => {
     const note =
       `${reduced.length} image(s) the user attached to this prompt were reduced ` +
       `(margin trimmed, at most ${settings.maxEdge}px) and saved as files; the inline copies were removed. ` +
-      `Read each file to view the image:\n${reduced.map(one => one.path).join('\n')}`
+      `Read each file to view the image, and do not read the original image file:\n${reduced.map(one => one.path).join('\n')}`
 
     pending.push(replaced)
 
@@ -576,7 +579,8 @@ export const register: Register = on => {
     $.ui.log(one.summary)
 
     // Without it the model reads the path the prompt names, at full size.
-    const note = `The image ${e.path} is attached in reduced form (as ${one.path}). Use the attached copy; do not read the original file.`
+    // No paths in it: both are in the prompt already, and a long path costs more than the note.
+    const note = MENTIONED_NOTE
 
     return { ...attached, context: [...(attached.context ?? []), note] }
   })
