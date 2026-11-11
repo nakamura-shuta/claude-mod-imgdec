@@ -1,0 +1,5 @@
+{
+  "name": "image-shrink",
+  "version": "0.1.0",
+  "description": "Downscales images attached to a prompt (drag-and-drop or paste) before the model reads them."
+}
