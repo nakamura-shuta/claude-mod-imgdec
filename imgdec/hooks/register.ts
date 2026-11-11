@@ -33,7 +33,28 @@ async function readSettings($: EngineInterface): Promise<Settings> {
 
 // ── Reducing one image ──
 
-const DIR = '/tmp/claude-imgdec'
+// Reduced images are throwaway: the per-user temporary folder (macOS: under
+// /var/folders, readable by this user alone), in a folder of our own kept at
+// 700 with files at 600, and emptied of anything older than a day.
+const DIR_NAME = 'claude-imgdec'
+const KEEP_DAYS = 1
+
+async function dirOf($: EngineInterface): Promise<string> {
+  const tmp = ((await $.env.get('TMPDIR')) ?? '').replace(/\/+$/, '')
+
+  return `${tmp === '' ? '/tmp' : tmp}/${DIR_NAME}`
+}
+
+/** Makes the folder (700) and removes what earlier prompts left more than KEEP_DAYS ago. */
+async function prepareDir($: EngineInterface): Promise<string> {
+  const dir = await dirOf($)
+
+  await $.process.run(['mkdir', '-p', dir])
+  await $.process.run(['chmod', '700', dir])
+  await $.process.run(['find', dir, '-type', 'f', '-mtime', `+${KEEP_DAYS}`, '-delete'])
+
+  return dir
+}
 
 // Trimming the plain margin (ImageMagick, when installed) keeps the text at
 // its size, so it runs before any downscale. A trim is kept only when it is
@@ -123,6 +144,7 @@ async function trim($: EngineInterface, path: string, before: Size): Promise<Siz
 async function reduce(
   $: EngineInterface,
   settings: Settings,
+  dir: string,
   id: string,
   index: number,
 ): Promise<Reduced | undefined> {
@@ -149,10 +171,7 @@ async function reduce(
       return undefined
     }
 
-    const path = `${DIR}/${await $.clock.now()}-${index}.${extension}`
-
-    await $.process.run(['mkdir', '-p', DIR])
-
+    const path = `${dir}/${await $.clock.now()}-${index}.${extension}`
     const decoded = await $.process.run(['base64', '-D', '-o', path], { stdin: base64 })
     const before = decoded.exitCode === 0 ? await sizeOf($, path) : undefined
     const steps: string[] = []
@@ -180,6 +199,8 @@ async function reduce(
 
       return undefined
     }
+
+    await $.process.run(['chmod', '600', path])
 
     const tokens = `~${tokensOf(before).toLocaleString('en-US')} → ${tokensOf(after).toLocaleString('en-US')} tokens`
 
@@ -225,7 +246,7 @@ async function runImgdec($: EngineInterface, args: string): Promise<CommandRunRe
     settings.isOn ? 'ON' : 'OFF',
     `- Max edge: ${settings.maxEdge}px`,
     `- Trim margins: ${trimNote}`,
-    `- Saved to: ${DIR}/`,
+    `- Saved to: ${await dirOf($)}/`,
   ]
 
   if (last === undefined) {
@@ -276,11 +297,12 @@ export const register: Register = on => {
       return next(e)
     }
 
+    const dir = await prepareDir($)
     const replaced: boolean[] = []
     const reduced: Reduced[] = []
 
     for (const [index, image] of images.entries()) {
-      const one = image.id === undefined ? undefined : await reduce($, settings, image.id, index)
+      const one = image.id === undefined ? undefined : await reduce($, settings, dir, image.id, index)
 
       replaced.push(one !== undefined)
 
