@@ -17,7 +17,7 @@ type Settings = {
 
 const DEFAULTS: Settings = { isOn: true, maxEdge: 1024, isTrimOn: true }
 const SETTINGS_KEY = 'settings'
-const USAGE = '使い方: /imgdec on|off（引数なしで今の状態を表示）'
+const USAGE = 'Usage: /imgdec [on|off]'
 
 /** The stored settings, each field falling back to its default when absent or of the wrong kind. */
 async function readSettings($: EngineInterface): Promise<Settings> {
@@ -54,7 +54,7 @@ type Size = { width: number; height: number }
 
 type Reduced = {
   path: string
-  /** What was done, for the person: `2000×1333 → 1024×682（縮小、約 3,456 → 925 トークン）`. */
+  /** What was done, for the person: `2000×1333 → 1024×682 (resize, ~3,456 → 925 tokens)`. */
   summary: string
 }
 
@@ -163,7 +163,7 @@ async function reduce(
 
       if (trimmed !== undefined) {
         after = trimmed
-        steps.push('余白カット')
+        steps.push('trim')
       }
     }
 
@@ -171,7 +171,7 @@ async function reduce(
       const resized = await $.process.run(['sips', '-Z', String(settings.maxEdge), path])
 
       after = resized.exitCode === 0 ? await sizeOf($, path) : undefined
-      steps.push('縮小')
+      steps.push('resize')
     }
 
     // Nothing gained (small already, no margin), or a step failed.
@@ -181,11 +181,11 @@ async function reduce(
       return undefined
     }
 
-    const tokens = `約 ${tokensOf(before).toLocaleString('en-US')} → ${tokensOf(after).toLocaleString('en-US')} トークン`
+    const tokens = `~${tokensOf(before).toLocaleString('en-US')} → ${tokensOf(after).toLocaleString('en-US')} tokens`
 
     return {
       path,
-      summary: `${before.width}×${before.height} → ${after.width}×${after.height}（${steps.join('＋')}、${tokens}）`,
+      summary: `${before.width}×${before.height} → ${after.width}×${after.height} (${steps.join(' + ')}, ${tokens})`,
     }
   } catch {
     return undefined
@@ -207,8 +207,8 @@ async function runImgdec($: EngineInterface, args: string): Promise<CommandRunRe
     return {
       text:
         arg === 'on'
-          ? 'ON にしました。添付した画像を、Claude に渡す前に小さくします'
-          : 'OFF にしました。添付した画像は、そのまま Claude に渡します',
+          ? 'ON. Attached images are reduced before Claude reads them.'
+          : 'OFF. Attached images are sent as they are.',
     }
   }
 
@@ -217,23 +217,21 @@ async function runImgdec($: EngineInterface, args: string): Promise<CommandRunRe
   }
 
   const trimNote = !settings.isTrimOn
-    ? 'しない'
+    ? 'off'
     : (await canTrim($))
-      ? 'する（ImageMagick あり）'
-      : 'できない（ImageMagick が無いので縮小だけ。brew install imagemagick）'
+      ? 'on'
+      : 'unavailable (ImageMagick not found: brew install imagemagick)'
   const lines = [
-    `今は ${settings.isOn ? 'ON' : 'OFF'} です`,
-    `- 長辺の上限: ${settings.maxEdge}px（超えた画像を縮小）`,
-    `- 余白カット: ${trimNote}`,
-    `- 保存先: ${DIR}/`,
+    settings.isOn ? 'ON' : 'OFF',
+    `- Max edge: ${settings.maxEdge}px`,
+    `- Trim margins: ${trimNote}`,
+    `- Saved to: ${DIR}/`,
   ]
 
   if (last === undefined) {
-    lines.push('- 直近の結果: まだありません（このセッションで読み込んでから）')
+    lines.push('- Last result: none yet')
   } else {
-    const time = new Date(last.at).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Tokyo' })
-
-    lines.push(`- 直近の結果（${time}）:`)
+    lines.push('- Last result:')
 
     for (const image of last.images) {
       lines.push(`  - ${image.summary} ${image.path}`)
@@ -255,7 +253,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'imgdec',
-      description: '添付した画像を Claude に渡す前に小さくする（on|off。引数なしで今の状態と直近の結果を表示）',
+      description: 'Reduce attached images before Claude reads them (on|off; no argument shows the status)',
       argumentHint: 'on|off',
       immediate: true,
     })

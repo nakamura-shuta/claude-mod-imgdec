@@ -1,5 +1,5 @@
 {
   "name": "imgdec",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Downscales images attached to a prompt (drag-and-drop or paste) before the model reads them."
 }
