@@ -1,8 +1,38 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 
-// Longest edge, in pixels, an attached image may keep. Larger ones are
-// downscaled to this; smaller ones are left attached as they are.
-const MAX_EDGE = 1024
+// ── Settings ──
+
+/**
+ * What the mod does to an attached image. Kept whole in `$.store` under
+ * SETTINGS_KEY; only `isOn` has a command today (`/imgdec on|off`), the rest
+ * are here so a later command can set them.
+ */
+type Settings = {
+  isOn: boolean
+  /** Longest edge, in pixels, an image may keep; larger ones are downscaled to it. */
+  maxEdge: number
+  /** Trim the plain margin first (needs ImageMagick). */
+  isTrimOn: boolean
+}
+
+const DEFAULTS: Settings = { isOn: true, maxEdge: 1024, isTrimOn: true }
+const SETTINGS_KEY = 'settings'
+const USAGE = '使い方: /imgdec on|off（引数なしで今の状態を表示）'
+
+/** The stored settings, each field falling back to its default when absent or of the wrong kind. */
+async function readSettings($: EngineInterface): Promise<Settings> {
+  const stored = await $.store.get(SETTINGS_KEY)
+  const held = typeof stored === 'object' && stored !== null ? (stored as Record<string, unknown>) : {}
+
+  return {
+    isOn: typeof held.isOn === 'boolean' ? held.isOn : DEFAULTS.isOn,
+    maxEdge: typeof held.maxEdge === 'number' && held.maxEdge >= 64 ? held.maxEdge : DEFAULTS.maxEdge,
+    isTrimOn: typeof held.isTrimOn === 'boolean' ? held.isTrimOn : DEFAULTS.isTrimOn,
+  }
+}
+
+// ── Reducing one image ──
+
 const DIR = '/tmp/claude-imgdec'
 
 // Trimming the plain margin (ImageMagick, when installed) keeps the text at
@@ -22,10 +52,15 @@ const EXTENSION: Record<string, string> = {
 
 type Size = { width: number; height: number }
 
-type Shrunk = {
+type Reduced = {
   path: string
-  /** The size before and after, for the notice: `2000×1333 → 1024×682`. */
-  sizes: string
+  /** What was done, for the person: `2000×1333 → 1024×682（縮小、約 3,456 → 925 トークン）`. */
+  summary: string
+}
+
+/** Claude's image cost: one token per 28×28 px patch, a partial patch counting whole. */
+function tokensOf(size: Size): number {
+  return Math.ceil(size.width / 28) * Math.ceil(size.height / 28)
 }
 
 // Whether `magick` runs here; asked once per load of the module.
@@ -85,11 +120,12 @@ async function trim($: EngineInterface, path: string, before: Size): Promise<Siz
  * if still large) and returns its path, or undefined when there is nothing to
  * gain or anything fails (the attachment then stays in the prompt untouched).
  */
-async function shrink(
+async function reduce(
   $: EngineInterface,
+  settings: Settings,
   id: string,
   index: number,
-): Promise<Shrunk | undefined> {
+): Promise<Reduced | undefined> {
   try {
     let base64 = ''
     let mediaType = ''
@@ -119,31 +155,115 @@ async function shrink(
 
     const decoded = await $.process.run(['base64', '-D', '-o', path], { stdin: base64 })
     const before = decoded.exitCode === 0 ? await sizeOf($, path) : undefined
-    let after = before === undefined ? undefined : ((await trim($, path, before)) ?? before)
+    const steps: string[] = []
+    let after = before
 
-    if (after !== undefined && Math.max(after.width, after.height) > MAX_EDGE) {
-      const resized = await $.process.run(['sips', '-Z', String(MAX_EDGE), path])
+    if (after !== undefined && before !== undefined && settings.isTrimOn) {
+      const trimmed = await trim($, path, before)
+
+      if (trimmed !== undefined) {
+        after = trimmed
+        steps.push('余白カット')
+      }
+    }
+
+    if (after !== undefined && Math.max(after.width, after.height) > settings.maxEdge) {
+      const resized = await $.process.run(['sips', '-Z', String(settings.maxEdge), path])
 
       after = resized.exitCode === 0 ? await sizeOf($, path) : undefined
+      steps.push('縮小')
     }
 
     // Nothing gained (small already, no margin), or a step failed.
-    if (before === undefined || after === undefined || after === before) {
+    if (before === undefined || after === undefined || steps.length === 0) {
       await $.process.run(['rm', '-f', path])
 
       return undefined
     }
 
-    return { path, sizes: `${before.width}×${before.height} → ${after.width}×${after.height}` }
+    const tokens = `約 ${tokensOf(before).toLocaleString('en-US')} → ${tokensOf(after).toLocaleString('en-US')} トークン`
+
+    return {
+      path,
+      summary: `${before.width}×${before.height} → ${after.width}×${after.height}（${steps.join('＋')}、${tokens}）`,
+    }
   } catch {
     return undefined
   }
 }
 
+// ── /imgdec ──
+
+/** The last prompt whose images were reduced, for `/imgdec`; this load of the module only. */
+let last: { at: number; images: Reduced[] } | undefined
+
+async function runImgdec($: EngineInterface, args: string): Promise<CommandRunResult> {
+  const arg = args.trim().toLowerCase()
+  const settings = await readSettings($)
+
+  if (arg === 'on' || arg === 'off') {
+    await $.store.set(SETTINGS_KEY, { ...settings, isOn: arg === 'on' })
+
+    return {
+      text:
+        arg === 'on'
+          ? 'ON にしました。添付した画像を、Claude に渡す前に小さくします'
+          : 'OFF にしました。添付した画像は、そのまま Claude に渡します',
+    }
+  }
+
+  if (arg !== '') {
+    return { text: USAGE }
+  }
+
+  const trimNote = !settings.isTrimOn
+    ? 'しない'
+    : (await canTrim($))
+      ? 'する（ImageMagick あり）'
+      : 'できない（ImageMagick が無いので縮小だけ。brew install imagemagick）'
+  const lines = [
+    `今は ${settings.isOn ? 'ON' : 'OFF'} です`,
+    `- 長辺の上限: ${settings.maxEdge}px（超えた画像を縮小）`,
+    `- 余白カット: ${trimNote}`,
+    `- 保存先: ${DIR}/`,
+  ]
+
+  if (last === undefined) {
+    lines.push('- 直近の結果: まだありません（このセッションで読み込んでから）')
+  } else {
+    const time = new Date(last.at).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Tokyo' })
+
+    lines.push(`- 直近の結果（${time}）:`)
+
+    for (const image of last.images) {
+      lines.push(`  - ${image.summary} ${image.path}`)
+    }
+  }
+
+  lines.push(USAGE)
+
+  return { text: lines.join('\n') }
+}
+
+// ── Hooks ──
+
 export const register: Register = on => {
   // One entry per submitted prompt still to be stored: for each of its images
-  // in order, whether the inline block is replaced by a downscaled file.
+  // in order, whether the inline block is replaced by a reduced file.
   const pending: boolean[][] = []
+
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: 'imgdec',
+      description: '添付した画像を Claude に渡す前に小さくする（on|off。引数なしで今の状態と直近の結果を表示）',
+      argumentHint: 'on|off',
+      immediate: true,
+    })
+
+    return next(e)
+  })
+
+  on('command.run', { command: 'imgdec' }, async ($, e) => runImgdec($, e.args))
 
   on('prompt.submit', async ($, e, next) => {
     const images = (e.attachments ?? []).filter(a => a.type === 'image')
@@ -152,33 +272,38 @@ export const register: Register = on => {
       return next(e)
     }
 
+    const settings = await readSettings($)
+
+    if (!settings.isOn) {
+      return next(e)
+    }
+
     const replaced: boolean[] = []
-    const paths: string[] = []
-    const sizes: string[] = []
+    const reduced: Reduced[] = []
 
     for (const [index, image] of images.entries()) {
-      const shrunk = image.id === undefined ? undefined : await shrink($, image.id, index)
+      const one = image.id === undefined ? undefined : await reduce($, settings, image.id, index)
 
-      replaced.push(shrunk !== undefined)
+      replaced.push(one !== undefined)
 
-      if (shrunk !== undefined) {
-        paths.push(shrunk.path)
-        sizes.push(shrunk.sizes)
+      if (one !== undefined) {
+        reduced.push(one)
       }
     }
 
-    if (paths.length === 0) {
+    if (reduced.length === 0) {
       return next(e)
     }
 
     const note =
-      `${paths.length} image(s) the user attached to this prompt were reduced ` +
-      `(margin trimmed, at most ${MAX_EDGE}px) and saved as files; the inline copies were removed. ` +
-      `Read each file to view the image:\n${paths.join('\n')}`
+      `${reduced.length} image(s) the user attached to this prompt were reduced ` +
+      `(margin trimmed, at most ${settings.maxEdge}px) and saved as files; the inline copies were removed. ` +
+      `Read each file to view the image:\n${reduced.map(one => one.path).join('\n')}`
 
     pending.push(replaced)
+    last = { at: await $.clock.now(), images: reduced }
     // A line in the transcript (not sent to the model): it stays, where a toast is easy to miss.
-    $.ui.log(`${sizes.join(', ')}`)
+    $.ui.log(reduced.map(one => one.summary).join(' / '))
 
     const entered = await next({ ...e, context: [...(e.context ?? []), note] })
 
