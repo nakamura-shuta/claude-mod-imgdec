@@ -1,6 +1,6 @@
 {
   "name": "imgdec",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Reduces images attached to a prompt (trim margins, downscale) before the model reads them. macOS and Linux.",
   "license": "MIT"
 }

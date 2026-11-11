@@ -4,20 +4,29 @@ import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 
 /**
  * What the mod does to an attached image. Kept whole in `$.store` under
- * SETTINGS_KEY and set by `/imgdec on|off` and `/imgdec max <px>`; `isTrimOn`
- * has no command yet.
+ * SETTINGS_KEY and set by `/imgdec on|off`, `/imgdec max <px>` and
+ * `/imgdec mode <mode>`; `isTrimOn` has no command yet.
  */
 type Settings = {
   isOn: boolean
+  /**
+   * How a reduced image reaches the model. `read`: the model is told to Read
+   * the file (one more request). `resend`: the submit is cancelled, the prompt
+   * box gets an `@` mention of the file, and the person presses Enter again
+   * (the engine attaches the file itself, no Read).
+   */
+  mode: Mode
   /** Longest edge, in pixels, an image may keep; larger ones are downscaled to it. */
   maxEdge: number
   /** Trim the plain margin first (needs ImageMagick). */
   isTrimOn: boolean
 }
 
-const DEFAULTS: Settings = { isOn: true, maxEdge: 1024, isTrimOn: true }
+type Mode = 'read' | 'resend'
+
+const DEFAULTS: Settings = { isOn: true, mode: 'read', maxEdge: 1024, isTrimOn: true }
 const SETTINGS_KEY = 'settings'
-const USAGE = 'Usage: /imgdec [on|off|max <px>]'
+const USAGE = 'Usage: /imgdec [on|off|max <px>|mode read|resend]'
 // What `/imgdec max` takes: under it text is lost, over it the engine has resized already.
 const MIN_MAX_EDGE = 256
 const MAX_MAX_EDGE = 2000
@@ -29,6 +38,7 @@ async function readSettings($: EngineInterface): Promise<Settings> {
 
   return {
     isOn: typeof held.isOn === 'boolean' ? held.isOn : DEFAULTS.isOn,
+    mode: held.mode === 'read' || held.mode === 'resend' ? held.mode : DEFAULTS.mode,
     maxEdge:
       typeof held.maxEdge === 'number' && held.maxEdge >= MIN_MAX_EDGE && held.maxEdge <= MAX_MAX_EDGE
         ? held.maxEdge
@@ -199,9 +209,48 @@ async function trim($: EngineInterface, path: string, before: Size): Promise<Siz
 }
 
 /**
- * Saves a smaller copy of one attached image (margin trimmed, then downscaled
- * if still large) and returns its path, or undefined when there is nothing to
- * gain or anything fails (the attachment then stays in the prompt untouched).
+ * Reduces the image file at `path` in place (margin trimmed, then downscaled
+ * if still large). Undefined, and the file removed, when there is nothing to
+ * gain or a step fails.
+ */
+async function shrink($: EngineInterface, settings: Settings, path: string): Promise<Reduced | undefined> {
+  const before = await sizeOf($, path)
+  const steps: string[] = []
+  let after = before
+
+  if (after !== undefined && before !== undefined && settings.isTrimOn) {
+    const trimmed = await trim($, path, before)
+
+    if (trimmed !== undefined) {
+      after = trimmed
+      steps.push('trim')
+    }
+  }
+
+  if (after !== undefined && Math.max(after.width, after.height) > settings.maxEdge) {
+    after = (await resize($, path, settings.maxEdge)) ? await sizeOf($, path) : undefined
+    steps.push('resize')
+  }
+
+  // Nothing gained (small already, no margin), or a step failed.
+  if (before === undefined || after === undefined || steps.length === 0) {
+    await $.process.run(['rm', '-f', path])
+
+    return undefined
+  }
+
+  const tokens = `~${tokensOf(before).toLocaleString('en-US')} → ${tokensOf(after).toLocaleString('en-US')} tokens`
+
+  return {
+    path,
+    summary: `${before.width}×${before.height} → ${after.width}×${after.height} (${steps.join(' + ')}, ${tokens})`,
+  }
+}
+
+/**
+ * Saves a smaller copy of one attached image and returns its path, or
+ * undefined when there is nothing to gain or anything fails (the attachment
+ * then stays in the prompt untouched).
  */
 async function reduce(
   $: EngineInterface,
@@ -236,37 +285,8 @@ async function reduce(
     const path = `${dir}/${index}.${extension}`
     // Through sh for the redirect: `--decode` is the one spelling macOS and GNU share.
     const decoded = await $.process.run(['sh', '-c', 'base64 --decode > "$1"', 'sh', path], { stdin: base64 })
-    const before = decoded.exitCode === 0 ? await sizeOf($, path) : undefined
-    const steps: string[] = []
-    let after = before
 
-    if (after !== undefined && before !== undefined && settings.isTrimOn) {
-      const trimmed = await trim($, path, before)
-
-      if (trimmed !== undefined) {
-        after = trimmed
-        steps.push('trim')
-      }
-    }
-
-    if (after !== undefined && Math.max(after.width, after.height) > settings.maxEdge) {
-      after = (await resize($, path, settings.maxEdge)) ? await sizeOf($, path) : undefined
-      steps.push('resize')
-    }
-
-    // Nothing gained (small already, no margin), or a step failed.
-    if (before === undefined || after === undefined || steps.length === 0) {
-      await $.process.run(['rm', '-f', path])
-
-      return undefined
-    }
-
-    const tokens = `~${tokensOf(before).toLocaleString('en-US')} → ${tokensOf(after).toLocaleString('en-US')} tokens`
-
-    return {
-      path,
-      summary: `${before.width}×${before.height} → ${after.width}×${after.height} (${steps.join(' + ')}, ${tokens})`,
-    }
+    return decoded.exitCode === 0 ? await shrink($, settings, path) : undefined
   } catch {
     return undefined
   }
@@ -306,6 +326,19 @@ async function runImgdec($: EngineInterface, args: string): Promise<CommandRunRe
     return { text: `Max edge: ${maxEdge}px. Larger images are downscaled to it.` }
   }
 
+  const mode = /^mode\s+(read|resend)$/.exec(arg)
+
+  if (mode !== null) {
+    await $.store.set(SETTINGS_KEY, { ...settings, mode: mode[1] })
+
+    return {
+      text:
+        mode[1] === 'resend'
+          ? 'Mode: resend. A prompt with an image is held once: press Enter again to send the reduced copy.'
+          : 'Mode: read. Claude reads the reduced copy from a file (one extra request).',
+    }
+  }
+
   if (arg !== '') {
     return { text: USAGE }
   }
@@ -315,6 +348,7 @@ async function runImgdec($: EngineInterface, args: string): Promise<CommandRunRe
   const trimNote = !settings.isTrimOn ? 'off' : found.magick ? 'on' : 'unavailable (needs ImageMagick)'
   const lines = [
     settings.isOn ? 'ON' : 'OFF',
+    `- Mode: ${settings.mode}`,
     `- Max edge: ${settings.maxEdge}px`,
     `- Trim margins: ${trimNote}`,
     `- Image tool: ${toolNote}`,
@@ -338,16 +372,32 @@ async function runImgdec($: EngineInterface, args: string): Promise<CommandRunRe
 
 // ── Hooks ──
 
+const RESENT_NOTE =
+  'The image(s) the user attached were reduced; the @ file(s) of this prompt are the reduced copies. Use them; do not read the original files.'
+
+/** Takes one prompt's entry out of `pending` when the prompt did not enter. */
+function forget(pending: boolean[][], replaced: boolean[]): void {
+  const at = pending.indexOf(replaced)
+
+  if (at !== -1) {
+    pending.splice(at, 1)
+  }
+}
+
 export const register: Register = on => {
   // One entry per submitted prompt still to be stored: for each of its images
   // in order, whether the inline block is replaced by a reduced file.
   const pending: boolean[][] = []
+  // `resend` mode: the folder whose files the prompt box was last given as `@`
+  // mentions, and which images of that prompt they stand for.
+  let refilled: { dir: string; replaced: boolean[] } | undefined
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'imgdec',
-      description: 'Reduce attached images before Claude reads them (on|off, max <px>; no argument shows the status)',
-      argumentHint: 'on|off|max <px>',
+      description:
+        'Reduce attached images before Claude reads them (on|off, max <px>, mode read|resend; no argument shows the status)',
+      argumentHint: 'on|off|max <px>|mode read|resend',
       immediate: true,
     })
 
@@ -361,6 +411,26 @@ export const register: Register = on => {
 
     if (e.command !== undefined || images.length === 0) {
       return next(e)
+    }
+
+    // The second Enter of `resend`: the engine has attached the `@` files, and
+    // the originals are still on the prompt. Their blocks and `[Image #N]`
+    // marks are taken out; an image added since is sent as it is.
+    if (refilled !== undefined && e.text.includes(`@${refilled.dir}/`)) {
+      const { replaced } = refilled
+      let mark = 0
+      const text = e.text.replace(/\[Image #\d+\]/g, found => (replaced[mark++] === true ? '' : found)).trim()
+
+      refilled = undefined
+      pending.push(replaced)
+
+      const entered = await next({ ...e, text, context: [...(e.context ?? []), RESENT_NOTE] })
+
+      if (entered.drop !== undefined) {
+        forget(pending, replaced)
+      }
+
+      return entered
     }
 
     const settings = await readSettings($)
@@ -393,27 +463,81 @@ export const register: Register = on => {
       return next(e)
     }
 
+    last = { at: await $.clock.now(), images: reduced }
+    // A line in the transcript (not sent to the model): it stays, where a toast is easy to miss.
+    $.ui.log(reduced.map(one => one.summary).join(' / '))
+
+    if (settings.mode === 'resend') {
+      // The engine expands an `@` mention only in a prompt the person submits,
+      // so this one is cancelled; the engine puts its draft back in the box.
+      const filled = await $.prompt.fill({ text: ` ${reduced.map(one => `@${one.path}`).join(' ')} `, mode: 'append' })
+
+      if (filled.isFilled) {
+        refilled = { dir, replaced }
+
+        return { drop: 'Image reduced. Press Enter again to send it.' }
+      }
+    }
+
     const note =
       `${reduced.length} image(s) the user attached to this prompt were reduced ` +
       `(margin trimmed, at most ${settings.maxEdge}px) and saved as files; the inline copies were removed. ` +
       `Read each file to view the image:\n${reduced.map(one => one.path).join('\n')}`
 
     pending.push(replaced)
-    last = { at: await $.clock.now(), images: reduced }
-    // A line in the transcript (not sent to the model): it stays, where a toast is easy to miss.
-    $.ui.log(reduced.map(one => one.summary).join(' / '))
 
     const entered = await next({ ...e, context: [...(e.context ?? []), note] })
 
     if (entered.drop !== undefined) {
-      const at = pending.indexOf(replaced)
-
-      if (at !== -1) {
-        pending.splice(at, 1)
-      }
+      forget(pending, replaced)
     }
 
     return entered
+  })
+
+  // An image named with `@`: the engine attaches the file itself (no Read), so
+  // a reduced copy is read in its place. In both modes.
+  on('prompt.mention', async ($, e, next) => {
+    const extension = /\.(png|jpe?g|webp)$/i.exec(e.path)?.[1]?.toLowerCase()
+
+    // Not an image, or a reduced copy already (the second Enter of `resend`).
+    if (extension === undefined || e.path.includes(`/${DIR_PREFIX}`)) {
+      return next(e)
+    }
+
+    let one: Reduced | undefined
+
+    try {
+      const settings = await readSettings($)
+      const found = await findTools($)
+
+      if (settings.isOn && (found.magick !== undefined || found.hasSips)) {
+        const path = `${await makeDir($)}/0.${extension}`
+        const copied = await $.process.run(['cp', e.path, path])
+
+        one = copied.exitCode === 0 ? await shrink($, settings, path) : undefined
+      }
+    } catch {
+      one = undefined
+    }
+
+    if (one === undefined) {
+      return next(e)
+    }
+
+    const attached = await next({ ...e, path: one.path })
+
+    if (attached.deny !== undefined || attached.type === null) {
+      return attached
+    }
+
+    last = { at: await $.clock.now(), images: [one] }
+    $.ui.log(one.summary)
+
+    // Without it the model reads the path the prompt names, at full size.
+    const note = `The image ${e.path} is attached in reduced form (as ${one.path}). Use the attached copy; do not read the original file.`
+
+    return { ...attached, context: [...(attached.context ?? []), note] }
   })
 
   on('session.append', { door: 'prompt' }, ($, e, next) => {
