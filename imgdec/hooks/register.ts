@@ -127,7 +127,7 @@ export const register: Register = on => {
 
     pending.push(replaced)
     // A line in the transcript (not sent to the model): it stays, where a toast is easy to miss.
-    $.ui.log(`imgdec: ${sizes.join(', ')}`)
+    $.ui.log(`${sizes.join(', ')}`)
 
     const entered = await next({ ...e, context: [...(e.context ?? []), note] })
 
