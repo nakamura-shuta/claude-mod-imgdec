@@ -126,7 +126,8 @@ export const register: Register = on => {
       `Read each file to view the image:\n${paths.join('\n')}`
 
     pending.push(replaced)
-    $.ui.toast(`imgdec: ${sizes.join(', ')}`, { timeoutMs: 10_000 })
+    // A line in the transcript (not sent to the model): it stays, where a toast is easy to miss.
+    $.ui.log(`imgdec: ${sizes.join(', ')}`)
 
     const entered = await next({ ...e, context: [...(e.context ?? []), note] })
 
