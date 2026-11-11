@@ -12,6 +12,12 @@ const EXTENSION: Record<string, string> = {
   'image/webp': 'webp',
 }
 
+type Shrunk = {
+  path: string
+  /** The size before and after, for the toast: `2000×1333 → 1024×682`. */
+  sizes: string
+}
+
 /**
  * Saves a downscaled copy of one attached image and returns its path, or
  * undefined when the image is small enough already or anything fails (the
@@ -21,7 +27,7 @@ async function shrink(
   $: EngineInterface,
   id: string,
   index: number,
-): Promise<string | undefined> {
+): Promise<Shrunk | undefined> {
   try {
     let base64 = ''
     let mediaType = ''
@@ -74,7 +80,10 @@ async function shrink(
       return undefined
     }
 
-    return path
+    const scale = MAX_EDGE / Math.max(width, height)
+    const sizes = `${width}×${height} → ${Math.round(width * scale)}×${Math.round(height * scale)}`
+
+    return { path, sizes }
   } catch {
     return undefined
   }
@@ -94,14 +103,16 @@ export const register: Register = on => {
 
     const replaced: boolean[] = []
     const paths: string[] = []
+    const sizes: string[] = []
 
     for (const [index, image] of images.entries()) {
-      const path = image.id === undefined ? undefined : await shrink($, image.id, index)
+      const shrunk = image.id === undefined ? undefined : await shrink($, image.id, index)
 
-      replaced.push(path !== undefined)
+      replaced.push(shrunk !== undefined)
 
-      if (path !== undefined) {
-        paths.push(path)
+      if (shrunk !== undefined) {
+        paths.push(shrunk.path)
+        sizes.push(shrunk.sizes)
       }
     }
 
@@ -115,7 +126,7 @@ export const register: Register = on => {
       `Read each file to view the image:\n${paths.join('\n')}`
 
     pending.push(replaced)
-    $.ui.toast(`imgdec: ${paths.length} image(s) → ≤${MAX_EDGE}px`)
+    $.ui.toast(`imgdec: ${sizes.join(', ')}`, { timeoutMs: 10_000 })
 
     const entered = await next({ ...e, context: [...(e.context ?? []), note] })
 
