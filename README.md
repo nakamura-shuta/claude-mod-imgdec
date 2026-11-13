@@ -22,7 +22,7 @@ Claude Code に添付した画像（ドラッグ&ドロップ・貼り付け）�
 
 3. Claude Code を起動し直す（起動中なら `/reload-plugins`）
 
-private リポジトリなので、読める権限と github.com の git 認証が必要です。対応は macOS と Linux です（Windows は対象外）。
+対応は macOS と Linux です（Windows は対象外）。
 
 ## 使い方
 

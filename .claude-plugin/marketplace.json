@@ -2,7 +2,7 @@
   "name": "claude-mod-imgdec",
   "description": "Claude Code に渡す画像を縮小する mod",
   "owner": {
-    "name": "nakamura.shuta"
+    "name": "nakamura-shuta"
   },
   "plugins": [
     {
